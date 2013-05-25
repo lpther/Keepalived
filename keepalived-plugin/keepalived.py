@@ -1,4 +1,5 @@
-__version__ = '0.1.0a'
+__website__ = 'https://github.com/lpther/Keepalived'
+__version__ = '0.1.0b'
 
 import sysadmintoolkit
 import os
@@ -25,6 +26,106 @@ def get_plugin(logger, config):
 
 
 class Keepalived(sysadmintoolkit.plugin.Plugin):
+    '''
+    Description
+    -----------
+
+    Provides a keepalived configuration manager, to manage an any-node
+    cluster of keepalived/LVS servers.
+
+    Some keywords are replaced in the master configuration file to
+    generate per node configuration.
+
+    Requirements
+    ------------
+
+    The plugin uses the Clustering plugin to communicated with nodes
+    across the cluster.
+
+    The keepalived package must be installed.
+
+    Configuration
+    -------------
+
+    *modes*
+      Supported modes:
+
+      ::
+
+        lvs:  Linux virtual server commands, such as healthchecks status (not implemented yet)
+        vrrp: VRRP commands, such as vrrp status display (not implemented yet)
+
+      Example: modes = lvs, vrrp
+
+      Default: no mode loaded by default
+
+    *live-config-file*
+      Configuration file used by the keepalived daemon,
+      must be the same on all nodes of the cluster.
+
+      Default: live-config-file = /etc/keepalived/keepalived.conf
+
+    *config-dir*
+      Main directory where revisions and master configuration
+      files are kept.
+
+      Default: config-dir = /etc/keepalived/master
+
+    *reload-cmd*
+      Command to trigger a reload of the keepalied daemon.
+
+      Default: reload-cmd = service keepalived reload
+
+    Master Configuration Special Keywords
+    -------------------------------------
+
+    *$slb_hostname*
+      This is replaced by the local hostname on each node. It must be left
+      verbatim in the *global_defs* section.
+
+      Example:
+
+      ::
+
+        global_defs  {
+          router_id $slb_hostname
+        }
+
+    *$master_backup*
+      This keyword takes 2 arguments: the node you want normally you service to run on, and
+      the second preferred node you want your service to run on.
+
+      This is a bloc of configuration that is present in a *vrrp_instance* bloc. This
+      replaces the "priority" keyword.
+
+      On the master node, the priority is switched to 150, on the backup 100 and on any other
+      node to 50.
+
+      Example:
+
+      ::
+
+        vrrp_instance vip-group-a {
+          state BACKUP
+          interface eth0
+          $master_backup node1 node2
+          [...]
+        }
+
+      This will replace generate 3 configuration files with
+      the line $master_backup changed to:
+
+      ::
+
+        Node        Declaration
+        -------------------------
+        node1       priority 150
+        node2       priority 100
+        node3       priority 50
+
+
+
+    '''
     def __init__(self, logger, config):
         super(Keepalived, self).__init__('keepalived', logger, config)
 
@@ -80,10 +181,6 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
         self.add_command(sysadmintoolkit.command.ExecCommand('debug keepalived', self, self.debug), modes=['root', 'config'])
         self.add_command(sysadmintoolkit.command.ExecCommand('show config keepalived', self, self.display_master_config_file), modes=['root', 'config'])
 
-        self.add_command(sysadmintoolkit.command.ExecCommand('edit keepalived', self, self.edit_master_config_file), modes=['config'])
-        self.add_command(sysadmintoolkit.command.ExecCommand('show config keepalived pending', self, self.display_pending_config), modes=['config'])
-        self.add_command(sysadmintoolkit.command.ExecCommand('commit keepalived', self, self.commit_pending_config), modes=['config'])
-
         self.pending_config = None
 
         self.logger.debug('Keepalived plugin initialization complete')
@@ -93,6 +190,10 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
 
         if 'clustering' in self.plugin_set.get_plugins():
             self.clustering_plugin = self.plugin_set.get_plugins()['clustering']
+            self.add_command(sysadmintoolkit.command.ExecCommand('edit keepalived', self, self.edit_master_config_file), modes=['config'])
+            self.add_command(sysadmintoolkit.command.ExecCommand('show config keepalived pending', self, self.display_pending_config), modes=['config'])
+            self.add_command(sysadmintoolkit.command.ExecCommand('commit keepalived', self, self.commit_pending_config), modes=['config'])
+
 
     def enter_mode(self, cmdprompt):
         super(Keepalived, self).enter_mode(cmdprompt)
@@ -186,7 +287,7 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
 
     def display_master_config_file(self, user_input_obj):
         '''
-        Displays the content of the master configuration file
+        Display the content of the master configuration file
         '''
         if self.clustering_plugin:
             print 'Verifying that master config file is synchronized across the cluster...'
@@ -242,7 +343,7 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
 
     def display_pending_config(self, user_input_obj):
         '''
-        Displays uncommitted configuration
+        Display uncommitted configuration
         '''
         if filecmp.cmp(self.master_config_file, self.pending_config['master_config'].name, shallow=False):
             print
@@ -259,8 +360,8 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
 
     def commit_pending_config(self, user_input_obj):
         '''
-        Generates configuration from new master configuration file, validates it, pushes it to
-        nodes of the cluster and reloads the keepalived daemon
+        Generate configuration from new master configuration file, validate, push to
+        nodes of the cluster and reload the keepalived daemon
         '''
         self.logger.info('Commit requested')
 
@@ -324,7 +425,7 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
             buffer_nodes_list = self.clustering_plugin.run_cluster_command('rsync -avrp --delete %s:%s %s; echo "Return Code=$?"' % \
                                                           (socket.gethostname(), self.config_dir, self.config_dir), \
                                                           self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name))
-            
+
             all_rsync_ok = True
             for (buffer, nodes) in buffer_nodes_list:
                 buffer_str = [c for c in buffer]
@@ -370,7 +471,7 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
 
     def debug(self, user_input_obj):
         '''
-        Displays keepalived configuration and state
+        Display keepalived configuration and state
         '''
         print 'Keepalived plugin configuration and state:'
         print
@@ -392,7 +493,9 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
         print '  Keepalived master configuration file: %s' % (self.master_config_file)
         print '  Keepalived reload command: "%s"' % self.reload_cmd
         print
-        print '  Path to keepalived external file parser: %s' % os.path.normpath('%s/keepalived-check.rb' % self.plugin_set.get_plugins()['commandprompt'].config['scripts-dir'])
+        print '  Path to keepalived external file parser: %s' % \
+                                os.path.normpath('%s/keepalived-check.rb' % \
+                                self.plugin_set.get_plugins()['commandprompt'].config['scripts-dir'])
         print
 
         if self.pending_config:
