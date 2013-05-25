@@ -4,8 +4,11 @@ import sysadmintoolkit
 import os
 import os.path
 import tempfile
-
-
+import shutil
+import filecmp
+import collections
+import time
+import socket
 
 global plugin_instance
 
@@ -68,8 +71,20 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
         else:
             self.prepare_config_dir()
 
+        self.reload_cmd = 'service keepalived reload'
+        if 'reload-cmd' in config:
+            self.reload_cmd = config['reload-cmd']
+
+        self.logger.debug('Using reload command "%s"' % self.reload_cmd)
+
         self.add_command(sysadmintoolkit.command.ExecCommand('debug keepalived', self, self.debug), modes=['root', 'config'])
         self.add_command(sysadmintoolkit.command.ExecCommand('show config keepalived', self, self.display_master_config_file), modes=['root', 'config'])
+
+        self.add_command(sysadmintoolkit.command.ExecCommand('edit keepalived', self, self.edit_master_config_file), modes=['config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('show config keepalived pending', self, self.display_pending_config), modes=['config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('commit keepalived', self, self.commit_pending_config), modes=['config'])
+
+        self.pending_config = None
 
         self.logger.debug('Keepalived plugin initialization complete')
 
@@ -79,10 +94,50 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
         if 'clustering' in self.plugin_set.get_plugins():
             self.clustering_plugin = self.plugin_set.get_plugins()['clustering']
 
+    def enter_mode(self, cmdprompt):
+        super(Keepalived, self).enter_mode(cmdprompt)
+
+        if cmdprompt.get_mode() == 'config':
+            self.logger.debug('Copying master config file to a temporary file')
+
+            master_config_copy = tempfile.NamedTemporaryFile()
+
+            self.pending_config = { 'master_config': master_config_copy, 'node_config_files': {} }
+            shutil.copyfile(self.master_config_file, master_config_copy.name)
+
+    def leave_mode(self, cmdprompt):
+        super(Keepalived, self).leave_mode(cmdprompt)
+
+        if cmdprompt.get_mode() == 'config':
+            if not filecmp.cmp(self.master_config_file, self.pending_config['master_config'].name, shallow=False):
+                self.logger.warning('Uncommitted configuration files')
+
+                print
+                print '  Pending keepalived configuration changes:'
+                self.display_pending_config(None)
+
+                while True:
+                    input = raw_input('>> Do you want to commit ? (y/n) - ')
+
+                    if input.lower() in ['y', 'yes', 'n', 'no']:
+                        break
+
+                    print
+
+                if input.lower() in ['n', 'no']:
+                    print
+                    print '  Aborting changes, no harm done!'
+                    print
+
+                elif input.lower() in ['y', 'yes']:
+                    self.commit_pending_config(None)
+
+            self.pending_config = None
+
     def prepare_config_dir(self):
         try:
-            self.logger.debug('Making sure RCS dir %s is present' % os.path.abspath('%s/RCS' % self.config_dir))
-            os.makedirs(os.path.abspath('%s/RCS' % self.config_dir))
+            self.logger.debug('Making sure archive dir %s is present' % os.path.abspath('%s/archive' % self.config_dir))
+            os.makedirs(os.path.abspath('%s/archive' % self.config_dir))
         except OSError as e:
             # Ignore if dir already exists
             if e.errno != 17:
@@ -97,10 +152,12 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
         '''
         parser_binpath = os.path.abspath('%s/keepalived-check.rb' % self.plugin_set.get_plugins()['commandprompt'].config['scripts-dir'])
 
-        parse_is_ok = True
+        (ret, out) = sysadmintoolkit.utils.get_status_output('cd %s; %s %s' % (os.path.dirname(parser_binpath), parser_binpath, filepath), self.logger)
+
+        return (ret == 0, out)
 
     def generate_config_from_master(self, master_config_file):
-        config_file_map = {}
+        config_file_map = collections.OrderedDict()
 
         if self.clustering_plugin:
             for node in self.plugin_set.get_plugins()['clustering'].get_nodeset(self.cluster_nodeset_name):
@@ -120,6 +177,8 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
                                                                    % (node_configfile), self.logger))
                 config_file_map[node]['sedresults'].append(sysadmintoolkit.utils.get_status_output("""sed -i '/^\s*\\$/d' %s""" \
                                                                    % (node_configfile), self.logger))
+
+        return config_file_map
 
     # Dynamic keywords
 
@@ -150,6 +209,165 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
 
         return 0
 
+    def edit_master_config_file(self, user_input_obj):
+        '''
+        Edit a copy of the master configuration file
+        '''
+        temp_master_file = tempfile.NamedTemporaryFile()
+        shutil.copyfile(self.pending_config['master_config'].name, temp_master_file.name)
+
+        self.logger.debug('Editing file %s' % temp_master_file.name)
+
+        sysadmintoolkit.utils.execute_interactive_cmd('vi %s' % temp_master_file.name, self.logger)
+
+        if filecmp.cmp(self.pending_config['master_config'].name, temp_master_file.name, shallow=False):
+            print
+            print 'No changes done, ignoring previous command'
+            print
+
+            return 0
+        else:
+            print
+            print 'The following changes were made:'
+            print
+
+            sysadmintoolkit.utils.execute_interactive_cmd('diff --label "Master Configuration File (Working Copy)" --label "Last Edit" -U 7 %s %s' \
+                                                          % (self.pending_config['master_config'].name, \
+                                                             temp_master_file.name), self.logger)
+
+            self.pending_config['master_config'].close()
+            self.pending_config['master_config'] = temp_master_file
+
+            return 0
+
+    def display_pending_config(self, user_input_obj):
+        '''
+        Displays uncommitted configuration
+        '''
+        if filecmp.cmp(self.master_config_file, self.pending_config['master_config'].name, shallow=False):
+            print
+            print '  No pending configuration'
+            print
+        else:
+            print
+
+            sysadmintoolkit.utils.execute_interactive_cmd('diff --label "Master Configuration File" --label "Pending Configuration File" -U 7 %s %s' \
+                                                      % (self.master_config_file, \
+                                                         self.pending_config['master_config'].name), self.logger)
+
+            print
+
+    def commit_pending_config(self, user_input_obj):
+        '''
+        Generates configuration from new master configuration file, validates it, pushes it to
+        nodes of the cluster and reloads the keepalived daemon
+        '''
+        self.logger.info('Commit requested')
+
+        if filecmp.cmp(self.master_config_file, self.pending_config['master_config'].name, shallow=False):
+            self.logger.warning('Master configuration file unchanged, no commit to do!')
+            return 0
+
+        self.logger.debug('Generating node configuration file')
+
+        self.pending_config['node_config'] = self.generate_config_from_master(self.pending_config['master_config'].name)
+
+        self.logger.debug('Pending config: %s' % self.pending_config)
+
+        sed_problem = False
+
+        for node in self.pending_config['node_config']:
+            for sed_result in self.pending_config['node_config'][node]['sedresults']:
+                if sed_result[0] is not 0:
+                    sed_problem = sed_result
+                    break
+
+        if sed_problem:
+            raise sysadmintoolkit.exception.PluginError(errmsg='Error generating node configuration file, sed result: \n%s' % sed_result[1], \
+                                                        errno=300, plugin=self)
+        else:
+            self.logger.info('Node configuration files generated successfully')
+
+        all_parse_ok = True
+        for node in self.pending_config['node_config']:
+            (parse_ok, msg) = self.parse_config_file(self.pending_config['node_config'][node]['node_configfile'].name)
+
+            if parse_ok:
+                self.logger.info('%s configuration file is OK' % node)
+            else:
+                self.logger.error('%s configuration file parsing FAILED:\n  %s' % (node, msg))
+                print 'Error parsing configuration for node %s:\n%s' % (node, msg)
+                print
+                print '>> Aborting commit!'
+                print
+
+                all_parse_ok = False
+
+                break
+
+        if all_parse_ok:
+            self.logger.info('All files have been parsed successfully')
+
+            self.logger.debug('Backing up previous master configuration file')
+            self.logger.debug('Populating config dir with new files')
+
+            time_suffix = time.strftime("%Y-%m-%d_%H:%M:%S", time.gmtime())
+            shutil.copy(self.master_config_file, '%s/archive/%s_%s' % (self.config_dir, os.path.basename(self.master_config_file), time_suffix))
+            shutil.copy(self.pending_config['master_config'].name, self.master_config_file)
+
+            for node in self.pending_config['node_config']:
+                shutil.copy(self.pending_config['node_config'][node]['node_configfile'].name, \
+                            '%s/%s_%s' % (self.config_dir, os.path.basename(self.master_config_file), node))
+
+            self.logger.info('Pushing files to other nodes')
+
+            buffer_nodes_list = self.clustering_plugin.run_cluster_command('rsync -avrp --delete %s:%s %s; echo "Return Code=$?"' % \
+                                                          (socket.gethostname(), self.config_dir, self.config_dir), \
+                                                          self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name))
+            
+            all_rsync_ok = True
+            for (buffer, nodes) in buffer_nodes_list:
+                buffer_str = [c for c in buffer]
+                if 'Return Code=0' not in buffer_str[-1]:
+                    all_rsync_ok = False
+                    self.logger.error('Problem with rsync with node %s:\n%s' % (nodes, '\n'.join(buffer_str)))
+
+            if all_rsync_ok:
+                self.logger.info('All files successfully pushed to all reachable nodes (%s)' % \
+                                 self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name))
+
+                buffer_nodes_list = self.clustering_plugin.run_cluster_command('cp %s_`uname -n` %s' % \
+                                                                               (self.master_config_file, self.live_config_file), \
+                                                                               self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name))
+
+                self.logger.info('Reloading keepalived on all nodes')
+
+                buffer_nodes_list = self.clustering_plugin.run_cluster_command('%s ; echo "Return Code=$?"' % self.reload_cmd, \
+                                                          self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name))
+
+                all_reload_ok = True
+                for (buffer, nodes) in buffer_nodes_list:
+                    buffer_str = [c for c in buffer]
+                    if 'Return Code=0' not in buffer_str[-1]:
+                        all_reload_ok = False
+                        self.logger.error('Problem with keepalived reload with node %s:\n%s' % (nodes, '\n'.join(buffer_str)))
+
+
+        self.pending_config['node_config'] = {}
+
+        if not all_parse_ok:
+            return 1
+        elif not all_rsync_ok:
+            return 2
+        elif not all_reload_ok:
+            return 3
+        else:
+            self.logger.debug('Commit completed successfully')
+            print
+            print 'Commit completed successfully'
+            print
+            return 0
+
     def debug(self, user_input_obj):
         '''
         Displays keepalived configuration and state
@@ -172,9 +390,14 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
         print '  Live keepalived configuration file: %s (writable = %s)' % (self.live_config_file, self.live_config_file_writable)
         print '  Keepalived configuration directory: %s (writable = %s)' % (self.config_dir, self.config_dir_writable)
         print '  Keepalived master configuration file: %s' % (self.master_config_file)
+        print '  Keepalived reload command: "%s"' % self.reload_cmd
         print
         print '  Path to keepalived external file parser: %s' % os.path.normpath('%s/keepalived-check.rb' % self.plugin_set.get_plugins()['commandprompt'].config['scripts-dir'])
-
         print
 
-        self.generate_config_from_master()
+        if self.pending_config:
+            print '  Configuration pending commit:'
+            print
+            print '    Master configuration file copy: %s' % self.pending_config['master_config'].name
+
+        print
