@@ -123,6 +123,11 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
         node2       priority 100
         node3       priority 50
 
+    Keepalived Configuration Parser
+    -------------------------------
+
+    The parser's original website is https://github.com/frsyuki/keepalived-check, but
+    the plugin uses a modified version available at https://github.com/lpther/keepalived-check
 
 
     '''
