@@ -1,9 +1,0 @@
-=======
-Changes
-=======
-
-
-0.1.0 - April 29, 2013
-======================
-* Use this file to describe changes to your software.
-* Initial release.
