@@ -66,8 +66,8 @@ class Keepalived(sysadmintoolkit.plugin.Plugin):
       Default: live-config-file = /etc/keepalived/keepalived.conf
 
     *config-dir*
-      Main directory where revisions and master configuration
-      files are kept.
+      Main directory where revisions, master configuration
+      and node configuration files are kept.
 
       Default: config-dir = /etc/keepalived/master
 
