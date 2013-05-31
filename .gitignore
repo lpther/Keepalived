@@ -35,4 +35,4 @@ nosetests.xml
 .pydevproject
 
 # Local stuff
-dependencies
+site-local
